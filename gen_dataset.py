@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+import string
 from typing import Sequence
 
 import cv2
@@ -18,6 +20,7 @@ from tqdm import tqdm
 LOGGER = logging.getLogger(__name__)
 
 NDArrayUInt8 = NDArray[np.uint8]
+NDArrayFloat32 = NDArray[np.float32]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASET_ROOT = SCRIPT_DIR / "fizz_yolo_dataset"
@@ -28,7 +31,38 @@ DEFAULT_IMAGE_WIDTH = 1280
 DEFAULT_TRAIN_RATIO = 0.8
 DEFAULT_AUG_PER_PLATE = 20
 DEFAULT_FIZZ_CLASS_INDEX = 3
-DEFAULT_CLASS_NAMES = ("person", "car", "truck", "fizz_sign")
+DEFAULT_CLASS_NAMES = tuple(
+    ["person", "car", "truck", "fizz_sign"]
+    + [f"letter_{char}" for char in string.ascii_uppercase]
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LetterMetadata:
+    """Metadata describing a single letter rendered on a plate."""
+
+    char: str
+    bbox: tuple[float, float, float, float]  # (x0, y0, x1, y1)
+
+    def polygon(self) -> NDArrayFloat32:
+        x0, y0, x1, y1 = self.bbox
+        return np.array(
+            [
+                [x0, y0],
+                [x1, y0],
+                [x1, y1],
+                [x0, y1],
+            ],
+            dtype=np.float32,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PlateSample:
+    """Represents a base plate image and its associated letter metadata."""
+
+    path: Path
+    letters: tuple[LetterMetadata, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +98,20 @@ class DatasetConfig:
                 self.plates_dir,
             )
 
+        missing_letters = [
+            char for char in string.ascii_uppercase if f"letter_{char}" not in self.class_names
+        ]
+        if missing_letters:
+            raise ValueError(
+                "class_names must include entries for all uppercase letters in the form "
+                "'letter_A' through 'letter_Z'. Missing: %s" % ", ".join(missing_letters)
+            )
+
+        if len(self.letter_class_indices) != 26:
+            raise ValueError(
+                "class_names configuration must map all 26 uppercase letters to unique labels."
+            )
+
     @property
     def images_train_dir(self) -> Path:
         return self.dataset_root / "images" / "train"
@@ -88,6 +136,16 @@ class DatasetConfig:
     def cv_image_size(self) -> tuple[int, int]:
         return self.image_width, self.image_height
 
+    @property
+    def letter_class_indices(self) -> dict[str, int]:
+        prefix = "letter_"
+        mapping = {}
+        for index, name in enumerate(self.class_names):
+            if name.startswith(prefix) and len(name) == len(prefix) + 1:
+                char = name[len(prefix) :].upper()
+                mapping[char] = index
+        return mapping
+
 
 def ensure_directories(config: DatasetConfig) -> None:
     """Create the dataset directory structure."""
@@ -100,14 +158,44 @@ def ensure_directories(config: DatasetConfig) -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
 
-def collect_plate_paths(plates_dir: Path) -> list[Path]:
-    """Collect plate image paths from the provided directory."""
+def load_plate_metadata(plate_path: Path) -> PlateSample:
+    """Load letter metadata associated with a plate image."""
+    metadata_path = plate_path.with_suffix(".json")
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata file not found for plate {plate_path.name}")
+
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    letters_raw = data.get("letters", [])
+    letters: list[LetterMetadata] = []
+    for entry in letters_raw:
+        char = str(entry.get("char", "")).strip().upper()
+        bbox = entry.get("bbox")
+        if not char or len(char) != 1 or bbox is None or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = (float(coord) for coord in bbox)
+        letters.append(LetterMetadata(char=char, bbox=(x0, y0, x1, y1)))
+
+    return PlateSample(path=plate_path, letters=tuple(letters))
+
+
+def collect_plate_samples(plates_dir: Path) -> list[PlateSample]:
+    """Collect plate samples (image + letter metadata) from the provided directory."""
     valid_suffixes = {".png", ".jpg", ".jpeg"}
-    return sorted(
-        path
-        for path in plates_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in valid_suffixes
-    )
+    samples: list[PlateSample] = []
+
+    for path in sorted(
+        p for p in plates_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_suffixes
+    ):
+        try:
+            samples.append(load_plate_metadata(path))
+        except FileNotFoundError:
+            LOGGER.warning("Skipping plate without metadata: %s", path.name)
+        except json.JSONDecodeError:
+            LOGGER.error("Invalid JSON metadata for plate: %s", path.name)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("Failed to load metadata for %s: %s", path.name, exc)
+
+    return samples
 
 
 def load_backgrounds(config: DatasetConfig) -> list[NDArrayUInt8]:
@@ -155,9 +243,47 @@ def random_background(
     )
 
 
+def polygons_from_letters(letters: Sequence[LetterMetadata]) -> NDArrayFloat32:
+    """Convert letter metadata into polygon coordinates."""
+    if not letters:
+        return np.empty((0, 4, 2), dtype=np.float32)
+    return np.stack([letter.polygon() for letter in letters], axis=0)
+
+
+def _apply_affine_to_polygons(
+    polygons: NDArrayFloat32, matrix: NDArray[np.float32]
+) -> NDArrayFloat32:
+    """Apply a 2x3 affine matrix to a set of polygons."""
+    if polygons.size == 0:
+        return polygons
+
+    flat = polygons.reshape(-1, 2)
+    ones = np.ones((flat.shape[0], 1), dtype=np.float32)
+    homogeneous = np.hstack([flat, ones])
+    transformed = homogeneous @ matrix.T
+    return transformed[:, :2].reshape(polygons.shape)
+
+
+def _apply_perspective_to_polygons(
+    polygons: NDArrayFloat32, matrix: NDArray[np.float32]
+) -> NDArrayFloat32:
+    """Apply a 3x3 perspective matrix to a set of polygons."""
+    if polygons.size == 0:
+        return polygons
+
+    flat = polygons.reshape(-1, 2)
+    ones = np.ones((flat.shape[0], 1), dtype=np.float32)
+    homogeneous = np.hstack([flat, ones])
+    transformed = homogeneous @ matrix.T
+    w = transformed[:, 2:3]
+    w = np.where(np.abs(w) < 1e-6, 1e-6, w)
+    normalized = transformed[:, :2] / w
+    return normalized.reshape(polygons.shape)
+
+
 def random_affine_on_sign(
-    sign_img: NDArrayUInt8, rng: random.Random
-) -> tuple[NDArrayUInt8, NDArrayUInt8]:
+    sign_img: NDArrayUInt8, polygons: NDArrayFloat32, rng: random.Random
+) -> tuple[NDArrayUInt8, NDArrayUInt8, NDArrayFloat32]:
     """Apply random scaling, rotation, and optional perspective warp to the sign.
 
     Returns
@@ -173,6 +299,9 @@ def random_affine_on_sign(
     new_height = max(1, int(round(height * scale)))
     resized = cv2.resize(sign_img, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
     mask = np.full((new_height, new_width), 255, dtype=np.uint8)
+    polygons_transformed = polygons.copy()
+    if polygons_transformed.size > 0:
+        polygons_transformed *= scale
 
     angle = rng.uniform(-25.0, 25.0)
     rotation_matrix = cv2.getRotationMatrix2D(
@@ -192,6 +321,7 @@ def random_affine_on_sign(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
+    rotation_matrix = rotation_matrix.astype(np.float32)
     mask = cv2.warpAffine(
         mask,
         rotation_matrix,
@@ -200,6 +330,7 @@ def random_affine_on_sign(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
+    polygons_transformed = _apply_affine_to_polygons(polygons_transformed, rotation_matrix)
 
     if rng.random() < 0.5:
         cur_height, cur_width = transformed.shape[:2]
@@ -232,10 +363,13 @@ def random_affine_on_sign(
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         )
+        polygons_transformed = _apply_perspective_to_polygons(
+            polygons_transformed, perspective_matrix.astype(np.float32)
+        )
 
     non_zero_y, non_zero_x = np.nonzero(mask)
     if non_zero_x.size == 0 or non_zero_y.size == 0:
-        return transformed, mask
+        return transformed, mask, polygons_transformed
 
     min_x, max_x = non_zero_x.min(), non_zero_x.max()
     min_y, max_y = non_zero_y.min(), non_zero_y.max()
@@ -243,7 +377,11 @@ def random_affine_on_sign(
     cropped_image = transformed[min_y : max_y + 1, min_x : max_x + 1]
     cropped_mask = mask[min_y : max_y + 1, min_x : max_x + 1]
 
-    return cropped_image, cropped_mask
+    if polygons_transformed.size > 0:
+        polygons_transformed[..., 0] -= float(min_x)
+        polygons_transformed[..., 1] -= float(min_y)
+
+    return cropped_image, cropped_mask, polygons_transformed
 
 
 def add_noise_blur(
@@ -269,10 +407,10 @@ def add_noise_blur(
 
 
 def compute_yolo_bbox(
-    x: int,
-    y: int,
-    width: int,
-    height: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
     image_width: int,
     image_height: int,
 ) -> tuple[float, float, float, float]:
@@ -302,18 +440,22 @@ def write_dataset_yaml(config: DatasetConfig) -> None:
 
 def _process_plate(
     plate_index: int,
-    plate_path: Path,
+    plate_sample: PlateSample,
     config: DatasetConfig,
     backgrounds: list[NDArrayUInt8],
     seed: int | None,
     progress: tqdm,
 ) -> list[Path]:
     """Worker function to generate augmentations for a single plate image."""
+    plate_path = plate_sample.path
     plate_img = cv2.imread(str(plate_path), cv2.IMREAD_COLOR)
     if plate_img is None:
         LOGGER.warning("Skipping unreadable plate image: %s", plate_path)
         progress.update(config.augmentations_per_plate)
         return []
+
+    letter_polygons_base = polygons_from_letters(plate_sample.letters)
+    letter_class_map = config.letter_class_indices
 
     rng_seed = seed + plate_index if seed is not None else None
     rng = random.Random(rng_seed)
@@ -324,7 +466,9 @@ def _process_plate(
         progress.update()
 
         background = random_background(backgrounds, config, np_rng)
-        transformed_sign, transformed_mask = random_affine_on_sign(plate_img, rng)
+        transformed_sign, transformed_mask, transformed_polygons = random_affine_on_sign(
+            plate_img, letter_polygons_base, rng
+        )
         if transformed_mask.max() == 0:
             LOGGER.debug(
                 "Skipping sample with empty mask (%s idx=%d)",
@@ -362,6 +506,57 @@ def _process_plate(
             config.image_height,
         )
 
+        label_lines = [
+            f"{config.fizz_sign_class_index} "
+            f"{bbox[0]:.6f} {bbox[1]:.6f} {bbox[2]:.6f} {bbox[3]:.6f}\n"
+        ]
+
+        if transformed_polygons.size > 0:
+            for letter_meta, polygon in zip(plate_sample.letters, transformed_polygons):
+                class_index = letter_class_map.get(letter_meta.char.upper())
+                if class_index is None:
+                    LOGGER.debug(
+                        "Skipping letter %s due to missing class index",
+                        letter_meta.char,
+                    )
+                    continue
+
+                xs = polygon[:, 0]
+                ys = polygon[:, 1]
+                min_x_letter = float(xs.min()) + x
+                max_x_letter = float(xs.max()) + x
+                min_y_letter = float(ys.min()) + y
+                max_y_letter = float(ys.max()) + y
+
+                min_x_letter = max(0.0, min(min_x_letter, float(config.image_width)))
+                max_x_letter = max(0.0, min(max_x_letter, float(config.image_width)))
+                min_y_letter = max(0.0, min(min_y_letter, float(config.image_height)))
+                max_y_letter = max(0.0, min(max_y_letter, float(config.image_height)))
+
+                width_letter = max_x_letter - min_x_letter
+                height_letter = max_y_letter - min_y_letter
+                if width_letter <= 1e-3 or height_letter <= 1e-3:
+                    LOGGER.debug(
+                        "Skipping degenerate letter bbox (%s idx=%d)",
+                        plate_path.name,
+                        idx,
+                    )
+                    continue
+
+                letter_bbox = compute_yolo_bbox(
+                    min_x_letter,
+                    min_y_letter,
+                    width_letter,
+                    height_letter,
+                    config.image_width,
+                    config.image_height,
+                )
+                label_lines.append(
+                    f"{class_index} "
+                    f"{letter_bbox[0]:.6f} {letter_bbox[1]:.6f} "
+                    f"{letter_bbox[2]:.6f} {letter_bbox[3]:.6f}\n"
+                )
+
         if rng.random() < config.train_ratio:
             img_dir = config.images_train_dir
             lbl_dir = config.labels_train_dir
@@ -377,11 +572,7 @@ def _process_plate(
             LOGGER.error("Failed to write image %s", img_path)
             continue
 
-        label_content = (
-            f"{config.fizz_sign_class_index} "
-            f"{bbox[0]:.6f} {bbox[1]:.6f} {bbox[2]:.6f} {bbox[3]:.6f}\n"
-        )
-        lbl_path.write_text(label_content, encoding="utf-8")
+        lbl_path.write_text("".join(label_lines), encoding="utf-8")
         generated.append(img_path)
 
     return generated
@@ -395,16 +586,17 @@ def generate_dataset(
         config = DatasetConfig()
 
     ensure_directories(config)
+    write_dataset_yaml(config)
 
     backgrounds = load_backgrounds(config)
-    plate_paths = collect_plate_paths(config.plates_dir)
-    if not plate_paths:
+    plate_samples = collect_plate_samples(config.plates_dir)
+    if not plate_samples:
         LOGGER.warning("No plate images found in %s", config.plates_dir)
         return []
 
     generated_images: list[Path] = []
 
-    total_attempts = len(plate_paths) * config.augmentations_per_plate
+    total_attempts = len(plate_samples) * config.augmentations_per_plate
     max_workers = os.cpu_count() or 1
     with tqdm(
         total=total_attempts,
@@ -416,18 +608,17 @@ def generate_dataset(
                 executor.submit(
                     _process_plate,
                     index,
-                    plate_path,
+                    plate_sample,
                     config,
                     backgrounds,
                     seed,
                     progress,
                 )
-                for index, plate_path in enumerate(plate_paths)
+                for index, plate_sample in enumerate(plate_samples)
             ]
             for future in as_completed(futures):
                 generated_images.extend(future.result())
 
-    write_dataset_yaml(config)
     LOGGER.info("Dataset created at %s", config.dataset_root)
     LOGGER.info("YAML written to %s", config.yaml_path)
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import string
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +24,35 @@ PLATE_HEIGHT = 600
 PLATE_WIDTH = 400
 
 
+def _draw_text_with_boxes(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    start_pos: tuple[float, float],
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, int, int],
+) -> list[dict[str, object]]:
+    """Draw text character-by-character and capture bounding boxes."""
+    cursor_x, cursor_y = start_pos
+    annotations: list[dict[str, object]] = []
+
+    for char in text:
+        if char == " ":
+            cursor_x += draw.textlength(" ", font=font)
+            continue
+
+        bbox = draw.textbbox((cursor_x, cursor_y), char, font=font)
+        draw.text((cursor_x, cursor_y), char, fill=fill, font=font)
+        annotations.append(
+            {
+                "char": char,
+                "bbox": [int(round(coord)) for coord in bbox],
+            }
+        )
+        cursor_x += draw.textlength(char, font=font)
+
+    return annotations
+
+
 def save_banner(clue_type: ClueType, clue_text: str, save_path: Path):
     font_size = 90
     font_path = Path("gen_tools/UbuntuMono-Regular.ttf")
@@ -31,13 +61,28 @@ def save_banner(clue_type: ClueType, clue_text: str, save_path: Path):
     monospace = ImageFont.truetype(font_path, font_size)
     font_color = (255, 0, 0)
 
+    letter_annotations: list[dict[str, object]] = []
+
     # TYPE
-    draw.text((250, 30), clue_type, font_color, font=monospace)
+    letter_annotations.extend(
+        _draw_text_with_boxes(draw, clue_type, (250, 30), monospace, font_color)
+    )
     # CLUE TEXT
-    draw.text((30, 250), clue_text, font_color, font=monospace)
+    letter_annotations.extend(
+        _draw_text_with_boxes(draw, clue_text, (30, 250), monospace, font_color)
+    )
 
     populated_banner = np.array(blank_plate_pil)
     cv2.imwrite(str(save_path), populated_banner)
+
+    metadata = {
+        "clue_type": clue_type,
+        "clue_text": clue_text,
+        "letters": letter_annotations,
+    }
+    save_path.with_suffix(".json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def random_clue_text():
@@ -62,7 +107,7 @@ def _generate_plate(task: tuple[int, str, str]):
 
 
 def main():
-    NUM_PLATES = 10000  # or more
+    NUM_PLATES = 5
     print(f"Generating {NUM_PLATES} plates")
     tasks = [(i, random.choice(TYPES), random_clue_text()) for i in range(NUM_PLATES)]
     max_workers = os.cpu_count() or 1

@@ -1,0 +1,1 @@
+uv run predict_single_image.py --weights enph353-fizz-yolo/yolo_fizz_obstacles_v1/weights/best.pt --image img.png

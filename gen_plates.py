@@ -107,7 +107,7 @@ def _generate_plate(task: tuple[int, str, str]):
 
 
 def main():
-    NUM_PLATES = 5
+    NUM_PLATES = 1000
     print(f"Generating {NUM_PLATES} plates")
     tasks = [(i, random.choice(TYPES), random_clue_text()) for i in range(NUM_PLATES)]
     max_workers = os.cpu_count() or 1

@@ -4,7 +4,6 @@ runs/
 .DS_Store
 __pycache__/
 fizz_yolo_dataset/
-img.png
 plates_unmodified/
 enph353-fizz-yolo/
 *.pt

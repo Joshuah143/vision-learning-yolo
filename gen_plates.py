@@ -57,7 +57,7 @@ def random_clue_text():
         return f"{w1} {w2}"
 
 def main():
-    NUM_PLATES = 10  # or more
+    NUM_PLATES = 10000  # or more
     for i in range(NUM_PLATES):
         key = random.choice(TYPES)
         value = random_clue_text()

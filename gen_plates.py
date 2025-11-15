@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import random
 import string
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -8,18 +9,22 @@ from typing import Literal, get_args
 
 import cv2
 import numpy as np
-import random
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
+
+from pipeline_config import PlatesConfig, load_pipeline_config
 
 ClueType = Literal["SIZE", "VICTIM", "CRIME", "TIME", "PLACE", "MOTIVE", "WEAPON", "BANDIT"]
 TYPES = list(get_args(ClueType))
 
-banner_path = Path("gen_tools/clue_banner.png")
-output_path = Path("plates_unmodified")
-output_path.mkdir(parents=True, exist_ok=True)
+SCRIPT_DIR = Path(__file__).resolve().parent
+BANNER_PATH = SCRIPT_DIR / "gen_tools" / "clue_banner.png"
+FONT_PATH = SCRIPT_DIR / "gen_tools" / "UbuntuMono-Regular.ttf"
 
-banner_canvas = cv2.imread(str(banner_path))
+banner_canvas = cv2.imread(str(BANNER_PATH))
+if banner_canvas is None:
+    raise FileNotFoundError(f"Unable to load banner template at {BANNER_PATH}")
+
 PLATE_HEIGHT = 600
 PLATE_WIDTH = 400
 
@@ -55,10 +60,9 @@ def _draw_text_with_boxes(
 
 def save_banner(clue_type: ClueType, clue_text: str, save_path: Path):
     font_size = 90
-    font_path = Path("gen_tools/UbuntuMono-Regular.ttf")
     blank_plate_pil = Image.fromarray(banner_canvas)
     draw = ImageDraw.Draw(blank_plate_pil)
-    monospace = ImageFont.truetype(font_path, font_size)
+    monospace = ImageFont.truetype(FONT_PATH, font_size)
     font_color = (255, 0, 0)
 
     letter_annotations: list[dict[str, object]] = []
@@ -101,18 +105,26 @@ def random_clue_text():
         return f"{w1} {w2}"
 
 
-def _generate_plate(task: tuple[int, str, str]):
+def _generate_plate(task: tuple[int, str, str], output_dir: Path):
     index, key, value = task
-    save_banner(key, value, output_path / f"{index}_{key}_{value}.png")
+    save_banner(key, value, output_dir / f"{index}_{key}_{value}.png")
 
 
-def main():
-    NUM_PLATES = 20000
-    print(f"Generating {NUM_PLATES} plates")
-    tasks = [(i, random.choice(TYPES), random_clue_text()) for i in range(NUM_PLATES)]
+def generate_plates(config: PlatesConfig | None = None) -> None:
+    if config is None:
+        config = load_pipeline_config().plates
+
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if config.seed is not None:
+        random.seed(config.seed)
+
+    print(f"Generating {config.num_plates} plates into {output_dir}")
+    tasks = [(i, random.choice(TYPES), random_clue_text()) for i in range(config.num_plates)]
     max_workers = os.cpu_count() or 1
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_generate_plate, task) for task in tasks]
+        futures = [executor.submit(_generate_plate, task, output_dir) for task in tasks]
         for future in tqdm(
             as_completed(futures),
             total=len(futures),
@@ -122,4 +134,4 @@ def main():
             future.result()
 
 if __name__ == "__main__":
-    main()
+    generate_plates()

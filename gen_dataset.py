@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
@@ -16,6 +15,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 from tqdm import tqdm
+
+from pipeline_config import DatasetSectionConfig, load_pipeline_config
 
 LOGGER = logging.getLogger(__name__)
 
@@ -161,10 +162,23 @@ def ensure_directories(config: DatasetConfig) -> None:
 def load_plate_metadata(plate_path: Path) -> PlateSample:
     """Load letter metadata associated with a plate image."""
     metadata_path = plate_path.with_suffix(".json")
+    
+    # Check existence with detailed logging for first few files
     if not metadata_path.exists():
         raise FileNotFoundError(f"Metadata file not found for plate {plate_path.name}")
 
-    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    try:
+        # Read file - this is where it might hang on volume mounts
+        metadata_text = metadata_path.read_text(encoding="utf-8")
+    except Exception as e:
+        LOGGER.error("Failed to read metadata file %s: %s", metadata_path, e)
+        raise
+    
+    try:
+        data = json.loads(metadata_text)
+    except json.JSONDecodeError as e:
+        LOGGER.error("Failed to parse JSON in %s: %s", metadata_path, e)
+        raise
     letters_raw = data.get("letters", [])
     letters: list[LetterMetadata] = []
     for entry in letters_raw:
@@ -180,21 +194,84 @@ def load_plate_metadata(plate_path: Path) -> PlateSample:
 
 def collect_plate_samples(plates_dir: Path) -> list[PlateSample]:
     """Collect plate samples (image + letter metadata) from the provided directory."""
-    valid_suffixes = {".png", ".jpg", ".jpeg"}
     samples: list[PlateSample] = []
 
-    for path in sorted(
-        p for p in plates_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_suffixes
-    ):
+    LOGGER.info("Collecting plate samples from directory: %s", plates_dir)
+    try:
+        # Use glob instead of iterdir for better reliability on network filesystems
+        image_files = (
+            list(plates_dir.glob("*.png"))
+            + list(plates_dir.glob("*.jpg"))
+            + list(plates_dir.glob("*.jpeg"))
+        )
+        LOGGER.info("Found %d image files via glob", len(image_files))
+    except Exception as e:
+        LOGGER.error("Failed to glob directory %s: %s", plates_dir, e)
+        raise
+    
+    LOGGER.info("Starting to load metadata for %d plate files", len(image_files))
+    LOGGER.info("Sorting file list...")
+    sorted_files = sorted(image_files)
+    LOGGER.info("Finished sorting, starting to process files")
+    
+    # Process files in parallel to avoid blocking on I/O
+    # For I/O-bound tasks (reading files), we can use many more workers than CPU cores
+    # Check environment for Modal CPU count, otherwise use os.cpu_count()
+    cpu_count = int(os.environ.get("MODAL_CPU_COUNT", os.cpu_count() or 4))
+    # For I/O-bound file reading, use 4-8x CPU count, but cap at reasonable limit
+    # With 32 CPUs allocated, this will use 128 workers (capped)
+    max_workers = min(128, max(32, cpu_count * 4))
+    LOGGER.info("Using %d workers for parallel metadata loading (I/O-bound, CPU count: %d)", 
+                max_workers, cpu_count)
+    
+    loaded_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    def _load_single_plate(path: Path) -> tuple[PlateSample | None, str]:
+        """Load a single plate's metadata, returning (sample, status)."""
         try:
-            samples.append(load_plate_metadata(path))
+            sample = load_plate_metadata(path)
+            return sample, "loaded"
         except FileNotFoundError:
-            LOGGER.warning("Skipping plate without metadata: %s", path.name)
+            return None, "skipped"
         except json.JSONDecodeError:
             LOGGER.error("Invalid JSON metadata for plate: %s", path.name)
+            return None, "error"
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Failed to load metadata for %s: %s", path.name, exc)
+            return None, "error"
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        LOGGER.info("Submitting %d tasks to executor", len(sorted_files))
+        futures = {executor.submit(_load_single_plate, path): path for path in sorted_files}
+        LOGGER.info("All tasks submitted, processing results...")
+        
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            path = futures[future]
+            
+            # Log progress every 1000 files or at start/end
+            if completed % 1000 == 0 or completed == 1 or completed == len(sorted_files):
+                LOGGER.info("Processed %d/%d plates (loaded: %d, skipped: %d, errors: %d)",
+                           completed, len(sorted_files), loaded_count, skipped_count, error_count)
+            
+            try:
+                sample, status = future.result()
+                if sample is not None:
+                    samples.append(sample)
+                    loaded_count += 1
+                elif status == "skipped":
+                    skipped_count += 1
+                else:
+                    error_count += 1
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("Unexpected error processing %s: %s", path.name, exc)
+                error_count += 1
 
+    LOGGER.info("Finished loading plate samples: %d loaded, %d skipped, %d errors",
+                loaded_count, skipped_count, error_count)
     return samples
 
 
@@ -585,11 +662,26 @@ def generate_dataset(
     if config is None:
         config = DatasetConfig()
 
+    LOGGER.info("Starting dataset generation with config: dataset_root=%s, plates_dir=%s", 
+                config.dataset_root, config.plates_dir)
+    
     ensure_directories(config)
+    LOGGER.info("Directories ensured")
+    
     write_dataset_yaml(config)
+    LOGGER.info("Dataset YAML written")
 
+    LOGGER.info("Loading backgrounds from %s", config.backgrounds_dir)
     backgrounds = load_backgrounds(config)
+    LOGGER.info("Loaded %d background images", len(backgrounds))
+
+    LOGGER.info("Collecting plate samples from %s", config.plates_dir)
+    if not config.plates_dir.exists():
+        LOGGER.error("Plates directory does not exist: %s", config.plates_dir)
+        raise FileNotFoundError(f"Plates directory does not exist: {config.plates_dir}")
+    
     plate_samples = collect_plate_samples(config.plates_dir)
+    LOGGER.info("Collected %d plate samples", len(plate_samples))
     if not plate_samples:
         LOGGER.warning("No plate images found in %s", config.plates_dir)
         return []
@@ -597,13 +689,20 @@ def generate_dataset(
     generated_images: list[Path] = []
 
     total_attempts = len(plate_samples) * config.augmentations_per_plate
-    max_workers = os.cpu_count() or 1
+    # For CPU-bound image processing, use actual CPU count
+    # Modal may allocate more CPUs than os.cpu_count() reports, so check environment
+    cpu_count = int(os.environ.get("MODAL_CPU_COUNT", os.cpu_count() or 4))
+    # Use the detected CPU count for CPU-bound work
+    max_workers = cpu_count
+    LOGGER.info("Starting ThreadPoolExecutor with %d workers for CPU-bound image processing (CPU count: %d), %d total attempts", 
+                max_workers, cpu_count, total_attempts)
     with tqdm(
         total=total_attempts,
         desc="Generating synthetic images",
         unit="img",
     ) as progress:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            LOGGER.info("Submitting %d tasks to executor", len(plate_samples))
             futures = [
                 executor.submit(
                     _process_plate,
@@ -625,103 +724,26 @@ def generate_dataset(
     return generated_images
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Generate a synthetic dataset for YOLO training.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def dataset_config_from_settings(settings: DatasetSectionConfig) -> DatasetConfig:
+    return DatasetConfig(
+        dataset_root=settings.dataset_root,
+        plates_dir=settings.plates_dir,
+        backgrounds_dir=settings.backgrounds_dir,
+        image_height=settings.image_height,
+        image_width=settings.image_width,
+        train_ratio=settings.train_ratio,
+        augmentations_per_plate=settings.augmentations_per_plate,
+        fizz_sign_class_index=settings.fizz_sign_class_index,
+        class_names=settings.class_names,
     )
-    parser.add_argument(
-        "--dataset-root",
-        type=Path,
-        default=DEFAULT_DATASET_ROOT,
-        help="Directory where the dataset will be created.",
-    )
-    parser.add_argument(
-        "--plates-dir",
-        type=Path,
-        default=DEFAULT_PLATES_DIR,
-        help="Directory containing the base plate images.",
-    )
-    parser.add_argument(
-        "--background-dir",
-        type=Path,
-        default=DEFAULT_BACKGROUNDS_DIR,
-        help="Directory containing optional background images.",
-    )
-    parser.add_argument(
-        "--image-width",
-        type=int,
-        default=DEFAULT_IMAGE_WIDTH,
-        help="Width of the generated images in pixels.",
-    )
-    parser.add_argument(
-        "--image-height",
-        type=int,
-        default=DEFAULT_IMAGE_HEIGHT,
-        help="Height of the generated images in pixels.",
-    )
-    parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=DEFAULT_TRAIN_RATIO,
-        help="Probability that a sample is assigned to the training split.",
-    )
-    parser.add_argument(
-        "--augmentations-per-plate",
-        type=int,
-        default=DEFAULT_AUG_PER_PLATE,
-        help="Number of augmented images generated per base plate.",
-    )
-    parser.add_argument(
-        "--fizz-sign-class-index",
-        type=int,
-        default=DEFAULT_FIZZ_CLASS_INDEX,
-        help="Class index to use for the fizz_sign label.",
-    )
-    parser.add_argument(
-        "--class-names",
-        nargs="+",
-        default=list(DEFAULT_CLASS_NAMES),
-        help="Class names for the dataset in order.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducible dataset generation.",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
-        help="Logging verbosity.",
-    )
-    return parser.parse_args()
 
 
 def main() -> None:
-    """Entry point for the dataset generation script."""
-    args = parse_args()
-
-    logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
-        format="%(levelname)s:%(name)s:%(message)s",
-    )
-
-    config = DatasetConfig(
-        dataset_root=args.dataset_root.resolve(),
-        plates_dir=args.plates_dir.resolve(),
-        backgrounds_dir=args.background_dir.resolve(),
-        image_height=args.image_height,
-        image_width=args.image_width,
-        train_ratio=args.train_ratio,
-        augmentations_per_plate=args.augmentations_per_plate,
-        fizz_sign_class_index=args.fizz_sign_class_index,
-        class_names=tuple(args.class_names),
-    )
-
-    generate_dataset(config, seed=args.seed)
+    """Entry point for dataset generation driven by pipeline_config.yaml."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    pipeline_cfg = load_pipeline_config()
+    config = dataset_config_from_settings(pipeline_cfg.dataset)
+    generate_dataset(config, seed=pipeline_cfg.dataset.seed)
 
 
 if __name__ == "__main__":

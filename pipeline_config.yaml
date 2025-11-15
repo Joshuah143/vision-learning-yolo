@@ -1,0 +1,59 @@
+plates:
+  num_plates: 15000
+  seed: null
+  output_dir: plates_unmodified
+
+dataset:
+  dataset_root: fizz_yolo_dataset
+  plates_dir: plates_unmodified
+  backgrounds_dir: backgrounds
+  image_height: 720
+  image_width: 1280
+  train_ratio: 0.8
+  augmentations_per_plate: 20
+  fizz_sign_class_index: 3
+  class_names:
+    - person
+    - car
+    - truck
+    - fizz_sign
+    - letter_A
+    - letter_B
+    - letter_C
+    - letter_D
+    - letter_E
+    - letter_F
+    - letter_G
+    - letter_H
+    - letter_I
+    - letter_J
+    - letter_K
+    - letter_L
+    - letter_M
+    - letter_N
+    - letter_O
+    - letter_P
+    - letter_Q
+    - letter_R
+    - letter_S
+    - letter_T
+    - letter_U
+    - letter_V
+    - letter_W
+    - letter_X
+    - letter_Y
+    - letter_Z
+  seed: null
+
+training:
+  weights_path: yolo12l.pt
+  project: enph353-fizz-yolo
+  run_name: yolo_fizz_obstacles_v1
+  epochs: 10
+  batch: 128
+  imgsz: 640
+  device: mps
+  optimizer: AdamW
+  lr0: 0.001
+  patience: 20
+
